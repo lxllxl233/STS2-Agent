@@ -1547,6 +1547,15 @@ internal static class GameStateService
             return string.Empty;
         }
 
+        // 先走游戏自己的 GetDescriptionForPile（会带正确的动态数值）。直接读
+        // Description/RulesText 再 GetFormattedText() 会因为缺变量让游戏每张牌
+        // 打一条 Localization formatting error 堆栈，一台机器一晚能写十几 GB 日志。
+        var resolved = TryGetResolvedCardRulesText(card);
+        if (!string.IsNullOrWhiteSpace(resolved))
+        {
+            return resolved;
+        }
+
         foreach (var memberName in new[]
         {
             "Description",
@@ -1569,6 +1578,12 @@ internal static class GameStateService
 
     private static string GetResolvedCardRulesText(CardModel? card)
     {
+        var resolved = TryGetResolvedCardRulesText(card);
+        return string.IsNullOrWhiteSpace(resolved) ? GetCardRulesText(card) : resolved;
+    }
+
+    private static string TryGetResolvedCardRulesText(CardModel? card)
+    {
         if (card == null)
         {
             return string.Empty;
@@ -1588,7 +1603,7 @@ internal static class GameStateService
         {
         }
 
-        return GetCardRulesText(card);
+        return string.Empty;
     }
 
     private static CardDynamicValuePayload[] BuildCardDynamicValuePayloads(CardModel? card)
