@@ -1393,7 +1393,7 @@ internal static class GameActionService
 
         var stable = currentScreen switch
         {
-            NCardGridSelectionScreen cardSelectScreen => await ConfirmDeckSelectionAsync(cardSelectScreen, TimeSpan.FromSeconds(10)),
+            NCardGridSelectionScreen cardSelectScreen => await SettleDeckCardPressAsync(cardSelectScreen),
             NChooseACardSelectionScreen chooseCardScreen => await WaitForChooseCardSelectionResolutionAsync(chooseCardScreen, TimeSpan.FromSeconds(10)),
             _ when isCombatHandSelection => await WaitForCombatHandSelectionStepAsync(combatHandSelection, TimeSpan.FromSeconds(10)),
             _ => false
@@ -1409,10 +1409,42 @@ internal static class GameActionService
         };
     }
 
+    /// <summary>点一张牌之后只等一两帧，不确认：确认交给 confirm_selection。</summary>
+    private static async Task<bool> SettleDeckCardPressAsync(NCardGridSelectionScreen screen)
+    {
+        for (var i = 0; i < 6; i++)
+        {
+            await WaitForNextFrameAsync();
+            if (!GodotObject.IsInstanceValid(screen) ||
+                !ReferenceEquals(ActiveScreenContext.Instance.GetCurrentScreen(), screen))
+            {
+                return true;
+            }
+        }
+
+        return true;
+    }
+
     private static async Task<ActionResponsePayload> ExecuteConfirmSelectionAsync()
     {
         var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
         var screen = GameStateService.ResolveScreen(currentScreen);
+
+        if (currentScreen is NCardGridSelectionScreen gridScreen &&
+            GameStateService.CanConfirmSelection(currentScreen))
+        {
+            var gridStable = await ConfirmDeckSelectionAsync(gridScreen, TimeSpan.FromSeconds(10));
+            return new ActionResponsePayload
+            {
+                action = "confirm_selection",
+                status = gridStable ? "completed" : "pending",
+                stable = gridStable,
+                message = gridStable
+                    ? "Action completed."
+                    : "Action queued but state is still transitioning.",
+                state = GameStateService.BuildStatePayload()
+            };
+        }
 
         if (!GameStateService.CanConfirmSelection(currentScreen) ||
             !GameStateService.TryGetCombatHandSelection(currentScreen, out var combatHand) ||
@@ -1841,11 +1873,17 @@ internal static class GameActionService
                 return await WaitForDeckSelectionResolutionAsync(screen, deadline);
             }
 
-            var confirmButton = screen.GetNodeOrNull<NConfirmButton>("%Confirm")
-                ?? screen.GetNodeOrNull<NConfirmButton>("Confirm");
-            if (confirmButton?.IsEnabled == true)
+            if (GameStateService.CheckDeckSelectionComplete(screen) == false)
             {
-                confirmButton.ForceClick();
+                // 还没选满：立刻返回，让调用方等下一步，而不是空转 10 秒。
+                return false;
+            }
+
+            if (GameStateService.TryGetDeckScreenConfirmButton(screen, out var deckConfirm) &&
+                deckConfirm != null)
+            {
+                deckConfirm.ForceClick();
+                return await WaitForDeckSelectionResolutionAsync(screen, deadline);
             }
         }
 

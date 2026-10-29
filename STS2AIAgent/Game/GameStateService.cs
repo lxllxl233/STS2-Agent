@@ -770,9 +770,99 @@ internal static class GameStateService
 
     public static bool CanConfirmSelection(IScreenContext? currentScreen)
     {
-        return TryGetCombatHandSelectionMetadata(currentScreen, out _, out var metadata) &&
+        return (TryGetCombatHandSelectionMetadata(currentScreen, out _, out var metadata) &&
             metadata.RequiresConfirmation &&
-            metadata.CanConfirm;
+            metadata.CanConfirm) ||
+            TryGetDeckScreenConfirmButton(currentScreen, out _);
+    }
+
+
+    /// <summary>null = 这版游戏没有这个方法，别拦；false = 还没选满。</summary>
+    public static bool? CheckDeckSelectionComplete(NCardGridSelectionScreen screen)
+    {
+        var method = screen.GetType().GetMethod(
+            "CheckIfSelectionComplete",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (method == null || method.ReturnType != typeof(bool) || method.GetParameters().Length != 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return (bool?)method.Invoke(screen, null);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static object? GetPrivateMemberValue(object instance, string name)
+    {
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        var field = instance.GetType().GetField(name, flags);
+        if (field != null)
+        {
+            return field.GetValue(instance);
+        }
+
+        return instance.GetType().GetProperty(name, flags)?.GetValue(instance);
+    }
+
+    /// <summary>
+    /// 牌组多选屏（NDeckCardSelectScreen 等）的确认按钮不在节点树约定名里：
+    /// 它们是私有字段 _confirmButton / _previewConfirmButton。旧版只找
+    /// %PreviewConfirm/%Confirm，于是「移除 N 张」永远确认不了。
+    /// </summary>
+    public static bool TryGetDeckScreenConfirmButton(IScreenContext? currentScreen, out NConfirmButton? button)
+    {
+        button = null;
+
+        if (currentScreen is not NCardGridSelectionScreen screen)
+        {
+            return false;
+        }
+
+        // 选不满就点确认 = 只移除 1 张（run 里实测会把「移除 2 张」事件直接结束）。
+        // 用游戏自己的 CheckIfSelectionComplete 把关；拿不到就退回“允许点”。
+        if (CheckDeckSelectionComplete(screen) == false)
+        {
+            return false;
+        }
+
+        var previewContainer = GetPrivateMemberValue(screen, "_previewContainer") as Control;
+        var previewConfirm = GetPrivateMemberValue(screen, "_previewConfirmButton") as NConfirmButton;
+        if (previewContainer?.Visible == true &&
+            previewConfirm != null &&
+            GodotObject.IsInstanceValid(previewConfirm) &&
+            previewConfirm.IsEnabled)
+        {
+            button = previewConfirm;
+            return true;
+        }
+
+        foreach (var name in new[] { "_confirmButton", "_multiPreviewConfirmButton", "_singlePreviewConfirmButton" })
+        {
+            if (GetPrivateMemberValue(screen, name) is NConfirmButton candidate &&
+                GodotObject.IsInstanceValid(candidate) &&
+                candidate.Visible &&
+                candidate.IsEnabled)
+            {
+                button = candidate;
+                return true;
+            }
+        }
+
+        var node = screen.GetNodeOrNull<NConfirmButton>("%Confirm")
+            ?? screen.GetNodeOrNull<NConfirmButton>("Confirm");
+        if (node != null && GodotObject.IsInstanceValid(node) && node.IsEnabled)
+        {
+            button = node;
+            return true;
+        }
+
+        return false;
     }
 
     public static bool CanProceed(IScreenContext? currentScreen)
@@ -3557,13 +3647,49 @@ internal static class GameStateService
                 _ => "deck_card_select"
             },
             prompt = GetDeckSelectionPrompt(currentScreen) ?? string.Empty,
-            min_select = combatHandSelection.MinSelect,
-            max_select = combatHandSelection.MaxSelect,
-            selected_count = combatHandSelection.SelectedCount,
-            requires_confirmation = combatHandSelection.RequiresConfirmation,
-            can_confirm = combatHandSelection.CanConfirm,
+            min_select = combatHandSelection.MinSelect > 0
+                ? combatHandSelection.MinSelect
+                : ParsePromptSelectCount(GetDeckSelectionPrompt(currentScreen)),
+            max_select = combatHandSelection.MaxSelect > 0
+                ? combatHandSelection.MaxSelect
+                : ParsePromptSelectCount(GetDeckSelectionPrompt(currentScreen)),
+            selected_count = combatHandSelection.SelectedCount > 0
+                ? combatHandSelection.SelectedCount
+                : CountDeckScreenSelection(currentScreen),
+            requires_confirmation = combatHandSelection.RequiresConfirmation ||
+                TryGetDeckScreenConfirmButton(currentScreen, out _),
+            can_confirm = combatHandSelection.CanConfirm ||
+                TryGetDeckScreenConfirmButton(currentScreen, out _),
             cards = cards.Select((holder, index) => BuildSelectionCardPayload(holder.CardModel!, index)).ToArray()
         };
+    }
+
+
+    private static int ParsePromptSelectCount(string? prompt)
+    {
+        // 提示里带 BBCode（"选择[blue]2[/blue]张牌来[gold]移除[/gold]"），先去掉标签。
+        var text = System.Text.RegularExpressions.Regex.Replace(
+            prompt ?? string.Empty,
+            @"\[[^\]]*\]",
+            string.Empty);
+        var match = System.Text.RegularExpressions.Regex.Match(text, @"\u9009\u62e9\s*(\d+)\s*\u5f20");
+        return match.Success ? int.Parse(match.Groups[1].Value) : 0;
+    }
+
+    /// <summary>牌组多选屏已选张数：NDeckCardSelectScreen._previewCards 是当前选择列表。</summary>
+    private static int CountDeckScreenSelection(IScreenContext? currentScreen)
+    {
+        if (currentScreen is not NCardGridSelectionScreen screen)
+        {
+            return 0;
+        }
+
+        if (GetPrivateMemberValue(screen, "_previewCards") is System.Collections.ICollection cards)
+        {
+            return cards.Count;
+        }
+
+        return 0;
     }
 
     private static CharacterSelectPayload? BuildCharacterSelectPayload(IScreenContext? currentScreen)
@@ -4805,7 +4931,7 @@ internal static class GameStateService
         return potion != null &&
             !potion.IsQueued &&
             !potion.Owner.Creature.IsDead &&
-            player.CanUseOrRemovePotions;
+            true; // 0.107.1 移除了 Player.CanUseOrRemovePotions（原 DLL 用 IL 补丁改成 true）
     }
 
     public static bool PotionRequiresTarget(CombatState? combatState, PotionModel potion)
